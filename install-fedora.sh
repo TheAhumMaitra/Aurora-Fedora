@@ -1084,12 +1084,12 @@ install_rust_packages() {
   # crate name -> installed binary name
   local -A rust_package_bins=(
     [termflix]="termflix"
-    [nmrs - tui]="nmrs-tui"
+    [nmrs-tui]="nmrs-tui"
     [bluetui]="bluetui"
     [leenfetch]="leenfetch"
     [weathr]="weathr"
     [wiremix]="wiremix"
-    [jolt - tui]="jolt"
+    [jolt-tui]="jolt"
     [mise]="mise"
   )
 
@@ -1120,7 +1120,9 @@ install_rust_packages() {
   local install_ok
 
   for package in "${rust_packages[@]}"; do
-    binary="${rust_package_bins[$package]}"
+    # Fall back to the crate name when no explicit mapping exists, so a missing
+    # key cannot abort the installer via `set -u` (unbound variable).
+    binary="${rust_package_bins[$package]:-$package}"
     ((++total_packages))
 
     if command -v "$binary" &>/dev/null || [ -x "$HOME/.cargo/bin/$binary" ]; then
