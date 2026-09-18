@@ -62,6 +62,25 @@ COPR_STARSHIP="atim/starship"
 COPR_SWAYOSD="erikreider/swayosd"
 COPR_HYPRLOCK_FALLBACK="solopasha/hyprland"
 
+# Display managers other than SDDM that can own the login screen.
+# Fedora enables gdm.service by default; the remaining entries are covered so
+# that a leftover display manager cannot reclaim display-manager.service after a
+# reboot. sddm.service itself is intentionally absent from this list.
+COMPETING_DMS=(
+  gdm.service
+  gdm3.service
+  lightdm.service
+  lxdm.service
+  lxdm-qt.service
+  xdm.service
+  wdm.service
+  slim.service
+  nodm.service
+  entrance.service
+  greetd.service
+  ly.service
+)
+
 error_handler() {
   local exit_code=$?
   local line_number="$1"
@@ -575,10 +594,10 @@ select_installation_mode() {
   echo -e "     ${DARK}Latest features but may be unstable${NC}"
   echo ""
 
-  read -p "Enter choice [1-2] (default: 1): " -n 1 choice
+  read -p "Enter choice [1-2] (default: 1): " -n 1 -r choice || true
   echo
 
-  case "$choice" in
+  case "${choice:-}" in
   2)
     INSTALL_MODE="git"
     log_info "Installation mode set to: GIT (bleeding edge)"
@@ -647,15 +666,15 @@ validate_hyprland() {
     echo ""
     echo -e "${YELLOW}This script configures Aurora for Hyprland (Wayland compositor).${NC}"
     echo ""
-    read -p "Are you using or planning to use Hyprland? (y/n) " -n 1 -r
+    read -p "Are you using or planning to use Hyprland? (y/n) " -n 1 -r || true
     echo
 
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+    if [[ ! ${REPLY:-} =~ ^[Yy]$ ]]; then
       print_warning "Aurora is designed for Hyprland. Proceeding may result in non-functional configs."
-      read -p "Continue anyway? (y/n) " -n 1 -r
+      read -p "Continue anyway? (y/n) " -n 1 -r || true
       echo
 
-      if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+      if [[ ! ${REPLY:-} =~ ^[Yy]$ ]]; then
         print_error "Installation cancelled"
         exit 0
       fi
@@ -797,10 +816,10 @@ install_dnf_packages() {
   done
 
   echo ""
-  read -p "Install Aurora packages? (y/n) " -n 1 -r
+  read -p "Install Aurora packages? (y/n) " -n 1 -r || true
   echo
 
-  if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+  if [[ ! ${REPLY:-} =~ ^[Yy]$ ]]; then
     print_warning "Skipping package installation"
     return
   fi
@@ -929,6 +948,102 @@ setup_network_manager() {
   log_info "NetworkManager enabled and competing network managers disabled"
 }
 
+# Return 0 when a display manager is enabled to start at boot.
+#
+# `systemctl is-enabled` is not used directly because it also exits 0 for
+# "static" units, which would make the caller try to disable units that have no
+# install section at all. The state string is matched explicitly instead.
+display_manager_enabled() {
+  local unit="$1"
+  local state
+
+  state="$(systemctl is-enabled "$unit" 2>/dev/null || true)"
+
+  case "$state" in
+  enabled | enabled-runtime | linked | linked-runtime | alias) return 0 ;;
+  *) return 1 ;;
+  esac
+}
+
+# Give SDDM exclusive ownership of the login screen.
+#
+# Fedora enables GDM by default and only one display manager may own
+# display-manager.service, so every competing display manager is disabled here
+# (GDM included) instead of only the first one that is detected.
+#
+# Plain `systemctl disable` is used without `--now` on purpose: stopping a
+# running display manager would terminate the desktop session (and this
+# installer) that the user is currently logged into. The switch takes effect on
+# the next boot.
+ensure_sddm_is_only_display_manager() {
+  local dm
+  local disabled_any=false
+  local remaining_dms=()
+  local dm_alias="/etc/systemd/system/display-manager.service"
+  local current_alias=""
+
+  for dm in "${COMPETING_DMS[@]}"; do
+    if ! display_manager_enabled "$dm"; then
+      continue
+    fi
+
+    print_warning "$dm is enabled and conflicts with sddm; disabling it"
+    log_info "Disabling competing display manager: $dm"
+
+    if sudo systemctl disable "$dm" 2>/dev/null; then
+      print_success "Disabled $dm"
+      disabled_any=true
+    else
+      print_warning "Could not disable $dm automatically; disable it with: sudo systemctl disable $dm"
+      log_warn "Failed to disable competing display manager: $dm"
+    fi
+  done
+
+  # Enabling SDDM last (re)creates the display-manager.service alias.
+  if ! sudo systemctl enable sddm.service; then
+    print_error "Failed to enable sddm.service"
+    echo "  Enable it manually with: sudo systemctl enable sddm.service"
+    log_error "systemctl enable sddm.service failed"
+    return 1
+  fi
+  print_success "Enabled sddm.service"
+
+  # Belt and braces: make sure the alias really points at SDDM and not at a
+  # leftover display manager.
+  if [ -L "$dm_alias" ]; then
+    current_alias="$(readlink "$dm_alias" 2>/dev/null || true)"
+  fi
+
+  if [ "$current_alias" != "/usr/lib/systemd/system/sddm.service" ]; then
+    sudo ln -sf /usr/lib/systemd/system/sddm.service "$dm_alias"
+    sudo systemctl daemon-reload
+    log_info "Pointed $dm_alias at sddm.service"
+  fi
+
+  # Verify the end state so a conflicting display manager cannot silently win.
+  for dm in "${COMPETING_DMS[@]}"; do
+    if display_manager_enabled "$dm"; then
+      remaining_dms+=("$dm")
+    fi
+  done
+
+  if [ ${#remaining_dms[@]} -gt 0 ]; then
+    print_warning "These display managers are still enabled: ${remaining_dms[*]}"
+    echo "  Disable them with: sudo systemctl disable ${remaining_dms[*]}"
+    log_warn "Display managers still enabled after setup: ${remaining_dms[*]}"
+    return 1
+  fi
+
+  if [ "$disabled_any" = true ]; then
+    log_info "Disabled one or more competing display managers"
+  else
+    log_info "No competing display managers were enabled"
+  fi
+
+  print_success "SDDM is the only display manager enabled at boot"
+  return 0
+}
+
 install_sddm_theme() {
   next_step "Installing SDDM astronaut theme"
 
@@ -936,11 +1051,13 @@ install_sddm_theme() {
   local theme_dir="/usr/share/sddm/themes/sddm-astronaut-theme"
   local sddm_conf="/etc/sddm.conf.d/theme.conf"
   local virtualkbd_conf="/etc/sddm.conf.d/virtualkbd.conf"
+  local theme_ready=false
 
   if [ "$DRY_RUN" = true ]; then
     print_warning "[DRY RUN] Would clone $theme_repo into $theme_dir"
     print_warning "[DRY RUN] Would copy theme fonts into /usr/share/fonts and refresh font cache"
     print_warning "[DRY RUN] Would write $sddm_conf and $virtualkbd_conf"
+    print_warning "[DRY RUN] Would disable competing display managers (gdm, lightdm, ...) and enable sddm.service"
     return 0
   fi
 
@@ -956,62 +1073,77 @@ install_sddm_theme() {
   sudo mkdir -p /usr/share/sddm/themes
   sudo mkdir -p /etc/sddm.conf.d
 
+  # A failed pull or clone must not abort the whole installation, so both are
+  # guarded and only the theme status is downgraded.
   if [ -d "$theme_dir/.git" ]; then
     log_info "Updating existing SDDM astronaut theme checkout"
-    sudo git -C "$theme_dir" pull --ff-only
+    if sudo git -C "$theme_dir" pull --ff-only; then
+      theme_ready=true
+    else
+      print_warning "Could not update the SDDM theme checkout; keeping the existing copy"
+      log_warn "git pull failed for the SDDM theme at $theme_dir"
+      theme_ready=true
+    fi
   elif [ -d "$theme_dir" ]; then
     log_warn "Theme directory already exists without git metadata: $theme_dir"
     print_warning "Reusing existing SDDM theme directory at $theme_dir"
+    theme_ready=true
   else
     log_info "Cloning SDDM astronaut theme from $theme_repo"
-    sudo git clone -b master --depth 1 "$theme_repo" "$theme_dir"
-  fi
-
-  if [ -d "$theme_dir/Fonts" ]; then
-    sudo mkdir -p /usr/share/fonts
-    sudo cp -rf "$theme_dir/Fonts/." /usr/share/fonts/
-    if command -v fc-cache &>/dev/null; then
-      sudo fc-cache -f /usr/share/fonts
+    if sudo git clone -b master --depth 1 "$theme_repo" "$theme_dir"; then
+      theme_ready=true
+    else
+      print_warning "Could not clone the SDDM astronaut theme; SDDM will fall back to its default theme"
+      log_warn "git clone failed for the SDDM theme: $theme_repo"
     fi
-    log_info "Installed SDDM theme fonts into /usr/share/fonts"
-  else
-    log_warn "Fonts directory not found in $theme_dir"
   fi
 
-  cat <<'EOF' | sudo tee "$sddm_conf" >/dev/null
+  if [ "$theme_ready" = true ]; then
+    if [ -d "$theme_dir/Fonts" ]; then
+      sudo mkdir -p /usr/share/fonts
+      if sudo cp -rf "$theme_dir/Fonts/." /usr/share/fonts/; then
+        if command -v fc-cache &>/dev/null; then
+          sudo fc-cache -f /usr/share/fonts || log_warn "fc-cache failed; the SDDM theme fonts may need a manual refresh"
+        fi
+        log_info "Installed SDDM theme fonts into /usr/share/fonts"
+      else
+        print_warning "Could not copy the SDDM theme fonts into /usr/share/fonts"
+        log_warn "Copying $theme_dir/Fonts into /usr/share/fonts failed"
+      fi
+    else
+      log_warn "Fonts directory not found in $theme_dir"
+    fi
+
+    cat <<'EOF' | sudo tee "$sddm_conf" >/dev/null
 [Theme]
 Current=sddm-astronaut-theme
 EOF
 
-  cat <<'EOF' | sudo tee "$virtualkbd_conf" >/dev/null
+    cat <<'EOF' | sudo tee "$virtualkbd_conf" >/dev/null
 [General]
 InputMethod=qtvirtualkeyboard
 EOF
+  fi
 
-  # Fedora often ships GDM enabled by default; only one display manager may run.
-  local competing_dm
-  for competing_dm in gdm.service lightdm.service lxdm.service lxdm-qt.service; do
-    if systemctl is-enabled --quiet "$competing_dm" 2>/dev/null; then
-      if [ "$INTERACTIVE" = true ]; then
-        echo ""
-        print_warning "$competing_dm is enabled and conflicts with sddm"
-        read -p "Disable $competing_dm? (y/n) " -n 1 -r
-        echo
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-          sudo systemctl disable --now "$competing_dm" 2>/dev/null || true
-          print_success "Disabled $competing_dm"
-        fi
-      else
-        print_warning "$competing_dm is still enabled; disable it manually if the login screen does not appear"
-      fi
-    fi
-  done
+  # Fedora ships GDM enabled by default and only one display manager may own the
+  # login screen, so SDDM takes over and every competing display manager is
+  # disabled (GDM included) in both interactive and non-interactive runs.
+  local dm_status_ok=true
+  if ! ensure_sddm_is_only_display_manager; then
+    dm_status_ok=false
+  fi
 
-  sudo systemctl enable sddm.service
-
-  SDDM_THEME_STATUS="configured and enabled"
-  print_success "SDDM astronaut theme installed and SDDM enabled at boot"
-  log_info "Configured SDDM to use sddm-astronaut-theme with qtvirtualkeyboard and enabled sddm.service"
+  if [ "$theme_ready" = true ] && [ "$dm_status_ok" = true ]; then
+    SDDM_THEME_STATUS="configured and enabled"
+    print_success "SDDM astronaut theme installed and SDDM enabled at boot"
+    log_info "Configured SDDM to use sddm-astronaut-theme with qtvirtualkeyboard, disabled competing display managers and enabled sddm.service"
+  elif [ "$theme_ready" = true ]; then
+    SDDM_THEME_STATUS="theme configured; check competing display managers"
+    print_warning "SDDM theme installed, but a competing display manager may still be enabled"
+  else
+    SDDM_THEME_STATUS="theme missing; SDDM enabled with the default theme"
+    print_warning "SDDM was enabled with its default theme because the astronaut theme is unavailable"
+  fi
 }
 
 # Build Rust scripts
@@ -1349,19 +1481,30 @@ install_waytrogen_aurora() {
   local schema_src="$repo_dir/org.Waytrogen.Waytrogen.gschema.xml"
   local user_schema_dir="$HOME/.local/share/glib-2.0/schemas"
 
+  if [ "$DRY_RUN" = true ]; then
+    print_warning "[DRY RUN] Would clone/build/install waytrogen-aurora and compile its GLib schema"
+    return 0
+  fi
+
   mkdir -p "$(dirname "$repo_dir")"
   mkdir -p "$user_schema_dir"
 
   if [ -d "$repo_dir/.git" ]; then
     log_info "Updating existing waytrogen-aurora checkout at $repo_dir"
-    git -C "$repo_dir" pull --ff-only
+    git -C "$repo_dir" pull --ff-only || print_warning "Could not update the waytrogen-aurora checkout"
   else
     log_info "Cloning waytrogen-aurora from $repo_url"
-    git clone "$repo_url" "$repo_dir"
+    if ! git clone "$repo_url" "$repo_dir"; then
+      print_error "Failed to clone waytrogen-aurora"
+      return 1
+    fi
   fi
 
   log_info "Installing waytrogen-aurora via cargo"
-  cargo install --path "$repo_dir" --locked
+  if ! cargo install --path "$repo_dir" --locked; then
+    print_error "Failed to build or install waytrogen-aurora"
+    return 1
+  fi
 
   if [ -f "$schema_src" ]; then
     if ! command -v glib-compile-schemas &>/dev/null; then
@@ -1369,10 +1512,12 @@ install_waytrogen_aurora() {
       return 0
     fi
 
-    cp -f "$schema_src" "$user_schema_dir/"
-    glib-compile-schemas "$user_schema_dir"
-
-    log_success "Installed and compiled user GLib schemas in $user_schema_dir"
+    if cp -f "$schema_src" "$user_schema_dir/" && glib-compile-schemas "$user_schema_dir"; then
+      log_success "Installed and compiled user GLib schemas in $user_schema_dir"
+    else
+      print_warning "Could not install or compile the waytrogen-aurora GLib schema"
+      log_warn "GLib schema install failed for $schema_src"
+    fi
   else
     log_warn "No schema file found in waytrogen-aurora repo, skipping schema install"
   fi
@@ -1876,10 +2021,10 @@ check_existing_install() {
     print_warning "This script will upgrade/overwrite your Aurora setup."
 
     if [ "$INTERACTIVE" = true ] && [ "$DRY_RUN" = false ]; then
-      read -p "Continue with re-installation? (y/n) " -n 1 -r
+      read -p "Continue with re-installation? (y/n) " -n 1 -r || true
       echo
 
-      if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+      if [[ ! ${REPLY:-} =~ ^[Yy]$ ]]; then
         print_error "Installation cancelled"
         exit 0
       fi
@@ -1898,10 +2043,10 @@ rollback_on_failure() {
   if [ -d "$BACKUP_DIR" ]; then
     echo ""
     echo "Backup found at $BACKUP_DIR"
-    read -p "Restore backed up configs? (y/n) " -n 1 -r
+    read -p "Restore backed up configs? (y/n) " -n 1 -r || true
     echo
 
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
+    if [[ ${REPLY:-} =~ ^[Yy]$ ]]; then
       for config_dir in hypr waybar kitty fish rofi; do
         restore_config_from_backup "$config_dir" "$BACKUP_DIR"
       done
@@ -1936,10 +2081,10 @@ EOF
   echo "  • Remove Aurora configs from ~/.config"
   echo ""
 
-  read -p "Proceed with uninstallation? (y/n) " -n 1 -r
+  read -p "Proceed with uninstallation? (y/n) " -n 1 -r || true
   echo
 
-  if [[ ! $REPLY =~ ^[Yy]$ ]]; then
+  if [[ ! ${REPLY:-} =~ ^[Yy]$ ]]; then
     print_warning "Uninstallation cancelled"
     return
   fi
@@ -1961,10 +2106,10 @@ EOF
 
   if [ -d "$latest_backup" ]; then
     print_warning "Found backup at $latest_backup"
-    read -p "Restore backed up configs? (y/n) " -n 1 -r
+    read -p "Restore backed up configs? (y/n) " -n 1 -r || true
     echo
 
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
+    if [[ ${REPLY:-} =~ ^[Yy]$ ]]; then
       print_warning "Restoring configs..."
       restore_config_from_backup "hypr" "$latest_backup"
       restore_config_from_backup "waybar" "$latest_backup"
@@ -2006,8 +2151,19 @@ final_setup() {
   echo -e "  ${BLUE}${BOLD}Install Type:${NC} ${WHITE}${DETECTED_INSTALL_TYPE^^}${NC}"
   echo ""
 
-  # Save installation state
-  cat >"$INSTALL_STATE_FILE" <<STATE_EOF
+  # Detect the Hyprland runtime without letting the INFO log lines leak into the
+  # JSON value below.
+  local hyprland_detected=false
+  if detect_hyprland_runtime >/dev/null 2>&1; then
+    hyprland_detected=true
+  fi
+
+  # Save installation state, but not in dry-run mode: a state file written by a
+  # dry run would make the next real run believe Aurora is already installed.
+  if [ "$DRY_RUN" = true ]; then
+    print_warning "[DRY RUN] Would save installation state to $INSTALL_STATE_FILE"
+  else
+    cat >"$INSTALL_STATE_FILE" <<STATE_EOF
 {
   "version": "1.0",
   "distro": "fedora",
@@ -2016,22 +2172,28 @@ final_setup() {
   "install_mode": "$INSTALL_MODE",
   "install_date": "$(date -u +%Y-%m-%dT%H:%M:%SZ)",
   "script_version": "$(git -C "$SCRIPT_DIR" describe --tags --always 2>/dev/null || echo 'unknown')",
-  "hyprland_runtime_detected": "$(detect_hyprland_runtime && echo 'true' || echo 'false')"
+  "hyprland_runtime_detected": "$hyprland_detected"
 }
 STATE_EOF
-  log_info "Saved installation state to $INSTALL_STATE_FILE"
+    log_info "Saved installation state to $INSTALL_STATE_FILE"
+  fi
 
   echo -e "${CYAN}${BOLD}Installation log:${NC} ${WHITE}$INSTALL_LOG${NC}"
   echo ""
 
-  if [ "$INTERACTIVE" = true ] && [ "$DRY_RUN" = false ] && [ "${SHELL##*/}" != "fish" ]; then
+  # `${SHELL##*/}` would abort under `set -u` when SHELL is unset, so derive the
+  # name defensively.
+  local current_shell="${SHELL:-}"
+  current_shell="${current_shell##*/}"
+
+  if [ "$INTERACTIVE" = true ] && [ "$DRY_RUN" = false ] && [ "$current_shell" != "fish" ]; then
     echo ""
     print_warning "Aurora is optimized for Fish shell."
 
-    read -p "Change default shell to Fish? (y/n) " -n 1 -r
+    read -p "Change default shell to Fish? (y/n) " -n 1 -r || true
     echo
 
-    if [[ $REPLY =~ ^[Yy]$ ]]; then
+    if [[ ${REPLY:-} =~ ^[Yy]$ ]]; then
       if command -v fish >/dev/null 2>&1; then
         local fish_path
         fish_path="$(command -v fish)"
@@ -2115,38 +2277,44 @@ EOF
 
 # Main installation flow
 main() {
-  # Handle command-line arguments
-  case "${1:-}" in
-  --help)
-    print_usage
-    exit 0
-    ;;
-  --dry-run)
-    DRY_RUN=true
-    ;;
-  --debug)
-    LOG_LEVEL="DEBUG"
-    DRY_RUN=false
-    ;;
-  --uninstall)
-    uninstall_aurora
-    exit 0
-    ;;
-  --non-interactive)
-    INTERACTIVE=false
-    ;;
-  --no-sudo-rs)
-    SWITCH_SUDO_RS=false
-    ;;
-  *)
-    if [ -n "${1:-}" ]; then
-      print_error "Unknown option: ${1:-}"
-      echo ""
+  # Keep the original arguments so the self-update re-exec can forward them.
+  local -a cli_args=("$@")
+  local arg
+
+  # Handle every command-line argument so flags can be combined, for example
+  # `--debug --dry-run` or `--non-interactive --no-sudo-rs`.
+  for arg in "$@"; do
+    case "$arg" in
+    --help)
       print_usage
-      exit 1
-    fi
-    ;;
-  esac
+      exit 0
+      ;;
+    --dry-run)
+      DRY_RUN=true
+      ;;
+    --debug)
+      LOG_LEVEL="DEBUG"
+      ;;
+    --uninstall)
+      uninstall_aurora
+      exit 0
+      ;;
+    --non-interactive)
+      INTERACTIVE=false
+      ;;
+    --no-sudo-rs)
+      SWITCH_SUDO_RS=false
+      ;;
+    *)
+      if [ -n "$arg" ]; then
+        print_error "Unknown option: $arg"
+        echo ""
+        print_usage
+        exit 1
+      fi
+      ;;
+    esac
+  done
 
   prepare_install_log
   initialize_logging
@@ -2165,7 +2333,11 @@ main() {
   fi
 
   # Run installation steps
-  self_update_from_github "$@"
+  if [ ${#cli_args[@]} -gt 0 ]; then
+    self_update_from_github "${cli_args[@]}"
+  else
+    self_update_from_github
+  fi
   check_fedora
   check_root
   check_home_disk_space
@@ -2195,6 +2367,7 @@ main() {
   else
     next_step "Installing SDDM astronaut theme"
     print_warning "[DRY RUN] Would clone/configure the SDDM astronaut theme and install fonts"
+    print_warning "[DRY RUN] Would disable competing display managers (gdm, lightdm, ...) and enable sddm.service"
 
     next_step "Building and installing Rust scripts"
     print_warning "[DRY RUN] Would build and install Rust scripts"
