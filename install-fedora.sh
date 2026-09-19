@@ -49,6 +49,7 @@ DETECTED_INSTALL_TYPE="fresh" # fresh, update, reinstall
 DISCOVERED_BINS=()
 SDDM_THEME_STATUS="not-run"
 DEFAULT_THEME_STATUS="not-run"
+FISH_SHELL_STATUS="not-run"
 MIN_HOME_FREE_MB="${AURORA_MIN_HOME_FREE_MB:-5120}"
 SWITCH_SUDO_RS=true
 FEDORA_VERSION="unknown"
@@ -615,9 +616,14 @@ check_dependencies() {
 
   local missing_deps=()
 
-  # Check for cargo
+  # Check for cargo (via rustup or rust toolchain)
   if ! command -v cargo &>/dev/null; then
     missing_deps+=("cargo (Rust package manager)")
+  fi
+
+  # Check for rustc
+  if ! command -v rustc &>/dev/null; then
+    missing_deps+=("rustc (Rust compiler)")
   fi
 
   # Check for git
@@ -630,11 +636,27 @@ check_dependencies() {
     missing_deps+=("make")
   fi
 
+  # Check for C compiler (gcc or clang)
+  if ! command -v gcc &>/dev/null && ! command -v clang &>/dev/null && ! command -v cc &>/dev/null; then
+    missing_deps+=("gcc or clang (C compiler)")
+  fi
+
+  # Check for C++ compiler (g++ or clang++)
+  if ! command -v g++ &>/dev/null && ! command -v clang++ &>/dev/null && ! command -v c++ &>/dev/null; then
+    missing_deps+=("gcc-c++ or clang (C++ compiler)")
+  fi
+
+  # Check for cmake (needed by many C/C++/Rust -sys builds)
+  if ! command -v cmake &>/dev/null; then
+    missing_deps+=("cmake")
+  fi
+
   if [ ${#missing_deps[@]} -gt 0 ]; then
     print_error "Missing required dependencies:"
     printf '%s\n' "${missing_deps[@]}" | sed 's/^/  - /'
     echo ""
-    print_warning "Install with: sudo dnf install -y rustup git make"
+    print_warning "Install full toolchain with: sudo dnf install -y git rustup gcc gcc-c++ make cmake ninja-build clang llvm lldb lld compiler-rt libomp-devel gdb pkgconf-pkg-config"
+    echo "  Then initialize Rust (if cargo/rustc still missing): rustup-init -y --default-toolchain stable --profile default && source ~/.cargo/env"
     echo ""
     exit 1
   fi
@@ -758,6 +780,10 @@ install_dnf_packages() {
             brightnessctl
             libnotify
             bluez
+            bluez-tools
+            util-linux-user
+            curl
+            xsel
             dejavu-sans-fonts
             google-noto-sans-fonts
             google-noto-color-emoji-fonts
@@ -773,23 +799,133 @@ install_dnf_packages() {
             zen-browser
             uv
             sudo-rs
+            xorg-x11-server-Xwayland
+            pipewire-utils
+            pipewire-alsa
+            pipewire-jack-audio-connection-kit
         "
     [build]="
             git
             rustup
+            rust
+            cargo
+            rust-analyzer
+            clippy
+            rustfmt
             gcc
+            gcc-c++
+            gcc-gfortran
+            glibc-devel
+            kernel-headers
+            binutils
+            binutils-devel
             make
+            cmake
+            cmake-data
+            ninja-build
+            meson
             pkgconf-pkg-config
             autoconf
             automake
             libtool
-            glib2-devel
-            cairo-devel
+            m4
+            bison
+            flex
+            texinfo
+            patch
+            diffutils
+            file
+            findutils
+            gdb
+            lldb
+            strace
+            clang
+            clang-devel
+            clang-tools-extra
+            clang-resource-filesystem
+            llvm
+            llvm-devel
+            llvm-libs
+            llvm-filesystem
+            llvm-static
+            lld
+            compiler-rt
+            libomp
+            libomp-devel
+            libstdc++-devel
+            perl
+            perl-core
+            python3
+            python3-devel
+            python3-pip
+            nodejs
+            npm
+            lua
+            lua-devel
+            compat-lua-libs
+            luajit
+            luajit-devel
+            luarocks
+            sqlite
+            sqlite-devel
+            tree-sitter-cli
+            inotify-tools
+            gettext
+            gettext-devel
+            ncurses-devel
+            ncurses-term
+            libedit-devel
+            libffi-devel
+            libxml2-devel
+            libzstd-devel
+            zlib-ng-compat-devel
+            xz-devel
+            bzip2-devel
+            brotli-devel
             openssl-devel
-            pipewire-devel
-            rofi-devel
+            openssl
+            pcre2-devel
+            libpng-devel
+            freetype-devel
+            fontconfig-devel
+            harfbuzz-devel
+            cairo-devel
+            cairo-gobject-devel
+            pango-devel
+            gdk-pixbuf2-devel
             gtk4-devel
             gtk4-layer-shell-devel
+            graphene-devel
+            vulkan-headers
+            vulkan-loader-devel
+            wayland-devel
+            xorg-x11-proto-devel
+            libX11-devel
+            libXau-devel
+            libxcb-devel
+            libXext-devel
+            libXrender-devel
+            libXft-devel
+            pixman-devel
+            fribidi-devel
+            libdatrie-devel
+            libthai-devel
+            graphite2-devel
+            lcms2-devel
+            glycin-devel
+            libseccomp-devel
+            libicu-devel
+            lzo-devel
+            libblkid-devel
+            libmount-devel
+            libselinux-devel
+            libsepol-devel
+            sysprof-capture-devel
+            dbus-devel
+            systemd-devel
+            glib2-devel
+            pipewire-devel
+            rofi-devel
             pulseaudio-libs-devel
             glib-networking
         "
@@ -1204,8 +1340,43 @@ build_rust_scripts() {
   return 0
 }
 
+install_mise() {
+  next_step "Installing mise"
+
+  if command -v mise &>/dev/null || [ -x "$HOME/.local/bin/mise" ] || [ -x "$HOME/.cargo/bin/mise" ]; then
+    print_success "mise is already installed"
+    return 0
+  fi
+
+  if [ "$DRY_RUN" = true ]; then
+    print_warning "[DRY RUN] Would install mise with: curl -fsSL https://mise.run | sh"
+    return 0
+  fi
+
+  if ! command -v curl &>/dev/null; then
+    print_error "curl is required to install mise"
+    echo "  Install with: sudo dnf install -y curl"
+    return 1
+  fi
+
+  log_info "Installing mise via official installer: curl -fsSL https://mise.run | sh"
+
+  if curl -fsSL https://mise.run | sh; then
+    log_command "Installed mise via official installer"
+    print_success "mise installed successfully (via https://mise.run)"
+    return 0
+  else
+    log_command "Failed to install mise via official installer"
+    print_error "mise installation failed (curl -fsSL https://mise.run | sh)"
+    return 1
+  fi
+}
+
 install_rust_packages() {
   next_step "Installing Rust packages"
+
+  # mise is installed via its official installer, not cargo.
+  install_mise || return 1
 
   if ! command -v cargo &>/dev/null; then
     print_error "cargo is required to install Rust packages"
@@ -1222,7 +1393,6 @@ install_rust_packages() {
     [weathr]="weathr"
     [wiremix]="wiremix"
     [jolt-tui]="jolt"
-    [mise]="mise"
   )
 
   local rust_packages=(
@@ -1233,10 +1403,10 @@ install_rust_packages() {
     weathr
     wiremix
     jolt-tui
-    mise
   )
 
   if [ "$DRY_RUN" = true ]; then
+    print_warning "[DRY RUN] Would install mise with: curl -fsSL https://mise.run | sh"
     print_warning "[DRY RUN] Would install Rust packages with cargo:"
     for package in "${rust_packages[@]}"; do
       echo "  - cargo install $package"
@@ -1264,11 +1434,7 @@ install_rust_packages() {
 
     log_info "Installing Rust package via cargo: $package"
 
-    if [ "$package" = "mise" ]; then
-      cargo install --locked "$package" && install_ok=true || install_ok=false
-    else
-      cargo install "$package" && install_ok=true || install_ok=false
-    fi
+    cargo install "$package" && install_ok=true || install_ok=false
 
     if [ "$install_ok" = true ]; then
       ((++installed_count))
@@ -2130,6 +2296,94 @@ EOF
   echo ""
 }
 
+# Set fish as the default login shell (always runs at the end)
+set_default_shell_to_fish() {
+  next_step "Setting fish as default shell"
+
+  if [ "$DRY_RUN" = true ]; then
+    FISH_SHELL_STATUS="dry-run: would set fish as default shell"
+    print_warning "[DRY RUN] Would set fish as default shell (chsh -s <fish>)"
+    return 0
+  fi
+
+  local fish_path=""
+  if command -v fish &>/dev/null; then
+    fish_path="$(command -v fish)"
+  elif [ -x /usr/bin/fish ]; then
+    fish_path="/usr/bin/fish"
+  else
+    FISH_SHELL_STATUS="failed: fish is not installed"
+    print_error "Fish shell is not installed; cannot set it as default shell"
+    echo "  Install with: sudo dnf install -y fish"
+    return 1
+  fi
+
+  log_info "fish binary: $fish_path"
+
+  # chsh refuses shells not listed in /etc/shells.
+  if [ -f /etc/shells ] && ! grep -Fxq "$fish_path" /etc/shells; then
+    if [ "$INTERACTIVE" = true ]; then
+      print_warning "$fish_path is not listed in /etc/shells; adding it (needs sudo)"
+    fi
+    if ! echo "$fish_path" | sudo tee -a /etc/shells >/dev/null; then
+      FISH_SHELL_STATUS="failed: could not add $fish_path to /etc/shells"
+      print_error "Failed to add $fish_path to /etc/shells"
+      return 1
+    fi
+    log_command "Added $fish_path to /etc/shells"
+  fi
+
+  # Already fish? Nothing to do — but still record success.
+  local current_login_shell=""
+  current_login_shell="$(getent passwd "$USER" 2>/dev/null | awk -F: '{print $NF}')" || true
+  if [ -n "$current_login_shell" ] && [ "$current_login_shell" = "$fish_path" ]; then
+    FISH_SHELL_STATUS="already fish ($fish_path)"
+    print_success "fish is already the default shell ($fish_path)"
+    return 0
+  fi
+
+  # Non-interactive mode: just do it (this is the documented end state).
+  if [ "$INTERACTIVE" = false ]; then
+    if chsh -s "$fish_path"; then
+      FISH_SHELL_STATUS="set to $fish_path"
+      log_command "Default shell changed to fish ($fish_path) via chsh"
+      print_success "Default shell changed to fish ($fish_path)"
+      print_warning "Log out and log back in for the change to apply"
+      return 0
+    else
+      FISH_SHELL_STATUS="failed: chsh -s $fish_path failed"
+      print_error "Failed to change default shell to fish"
+      return 1
+    fi
+  fi
+
+  # Interactive: confirm once, then change.
+  echo ""
+  print_warning "Aurora uses fish as its default shell."
+  echo -e "  ${WHITE}Current login shell:${NC} ${CYAN}${current_login_shell:-unknown}${NC}"
+  echo -e "  ${WHITE}Aurora default:${NC}      ${CYAN}$fish_path${NC}"
+  echo ""
+  read -p "Change default shell to fish? (Y/n) " -n 1 -r || true
+  echo
+  if [[ ${REPLY:-} =~ ^[Nn]$ ]]; then
+    FISH_SHELL_STATUS="skipped by user (stayed on ${current_login_shell:-unknown})"
+    print_warning "Kept current login shell (${current_login_shell:-unknown})"
+    return 0
+  fi
+
+  if chsh -s "$fish_path"; then
+    FISH_SHELL_STATUS="set to $fish_path"
+    log_command "Default shell changed to fish ($fish_path) via chsh"
+    print_success "Default shell changed to fish ($fish_path)"
+    print_warning "Log out and log back in for the change to apply"
+    return 0
+  else
+    FISH_SHELL_STATUS="failed: chsh -s $fish_path failed"
+    print_error "Failed to change default shell to fish"
+    return 1
+  fi
+}
+
 # Final setup
 final_setup() {
   echo ""
@@ -2145,6 +2399,7 @@ final_setup() {
   echo -e "  ${GREEN}✓${NC} ${WHITE}LazyVim starter installed to ~/.config/nvim${NC}"
   echo -e "  ${GREEN}✓${NC} ${WHITE}Configuration files installed${NC}"
   echo -e "  ${GREEN}✓${NC} ${WHITE}Shell environment configured${NC}"
+  echo -e "  ${CYAN}•${NC} ${WHITE}Default shell:${NC} ${YELLOW}${FISH_SHELL_STATUS}${NC}"
   print_rule
   echo -e "  ${BLUE}${BOLD}Distro:${NC} ${WHITE}Fedora ${FEDORA_VERSION}${NC}"
   echo -e "  ${BLUE}${BOLD}Mode:${NC} ${WHITE}${INSTALL_MODE^^}${NC}"
@@ -2180,35 +2435,6 @@ STATE_EOF
 
   echo -e "${CYAN}${BOLD}Installation log:${NC} ${WHITE}$INSTALL_LOG${NC}"
   echo ""
-
-  # `${SHELL##*/}` would abort under `set -u` when SHELL is unset, so derive the
-  # name defensively.
-  local current_shell="${SHELL:-}"
-  current_shell="${current_shell##*/}"
-
-  if [ "$INTERACTIVE" = true ] && [ "$DRY_RUN" = false ] && [ "$current_shell" != "fish" ]; then
-    echo ""
-    print_warning "Aurora is optimized for Fish shell."
-
-    read -p "Change default shell to Fish? (y/n) " -n 1 -r || true
-    echo
-
-    if [[ ${REPLY:-} =~ ^[Yy]$ ]]; then
-      if command -v fish >/dev/null 2>&1; then
-        local fish_path
-        fish_path="$(command -v fish)"
-
-        if chsh -s "$fish_path"; then
-          print_success "Default shell changed to Fish"
-          print_warning "Log out and log back in for changes to apply"
-        else
-          print_error "Failed to change default shell to Fish"
-        fi
-      else
-        print_error "Fish shell is not installed"
-      fi
-    fi
-  fi
 
   echo -e "${MAGENTA}${BOLD}Next Steps${NC}"
   print_rule
@@ -2395,6 +2621,8 @@ main() {
     next_step "Setting up shell configuration"
     print_warning "[DRY RUN] Would update shell PATH"
 
+    set_default_shell_to_fish
+
     next_step "Verifying installation"
     print_warning "[DRY RUN] Would verify installed binaries and PATH"
 
@@ -2405,6 +2633,8 @@ main() {
     DEFAULT_THEME_STATUS="dry-run: would apply Aurora Default"
     print_warning "[DRY RUN] Would apply default theme - Aurora Default"
   fi
+
+  set_default_shell_to_fish
 
   final_setup
 
