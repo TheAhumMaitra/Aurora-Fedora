@@ -61,6 +61,7 @@ COPR_NERD_FONTS="maveonair/jetbrains-mono-nerd-fonts"
 COPR_NERD_FONTS_FALLBACK="maveonair/desktop-tools"
 COPR_STARSHIP="atim/starship"
 COPR_SWAYOSD="erikreider/swayosd"
+COPR_HYPRMONCFG="paolino/hyprmoncfg"
 COPR_HYPRLOCK_FALLBACK="solopasha/hyprland"
 
 # Display managers other than SDDM that can own the login screen.
@@ -371,7 +372,8 @@ enable_copr_repositories() {
       "$COPR_ZEN_BROWSER" \
       "$COPR_NERD_FONTS" \
       "$COPR_STARSHIP" \
-      "$COPR_SWAYOSD"; do
+      "$COPR_SWAYOSD" \
+      "$COPR_HYPRMONCFG"; do
       echo "  - sudo dnf copr enable $repo"
     done
     return 0
@@ -392,6 +394,8 @@ enable_copr_repositories() {
   enable_copr "$COPR_STARSHIP" || true
   # swayosd (volume/brightness OSD used by Aurora keybinds)
   enable_copr "$COPR_SWAYOSD" || true
+  # hyprmoncfg (Hyprland monitor configuration tool)
+  enable_copr "$COPR_HYPRMONCFG" || true
 
   print_success "COPR repository setup finished"
 }
@@ -747,6 +751,7 @@ install_dnf_packages() {
             hyprsunset
             awww
             swayosd
+            hyprmoncfg
             cliphist
             NetworkManager
             NetworkManager-wifi
@@ -761,6 +766,7 @@ install_dnf_packages() {
         "
     [ui]="
             $waybar_pkg
+            quickshell
             rofi
             wlogout
             nwg-dock-hyprland
@@ -899,6 +905,10 @@ install_dnf_packages() {
             vulkan-headers
             vulkan-loader-devel
             wayland-devel
+            wayland-protocols-devel
+            json-c-devel
+            libxkbcommon-devel
+            librsvg2-devel
             xorg-x11-proto-devel
             libX11-devel
             libXau-devel
@@ -1634,6 +1644,66 @@ install_rofi_emoji() {
   fi
 
   print_error "Failed to build or install rofi-emoji"
+  cd "$old_pwd" || true
+  return 1
+}
+
+# Build and install snappy-switcher (Alt+Tab window switcher for Hyprland) from source
+install_snappy_switcher() {
+  next_step "Building snappy-switcher from source"
+
+  local repo_url="https://github.com/OpalAayan/snappy-switcher.git"
+  local repo_dir="$HOME/.local/share/Aurora/src/snappy-switcher"
+
+  if [ "$DRY_RUN" = true ]; then
+    print_warning "[DRY RUN] Would clone/build/install snappy-switcher from $repo_url"
+    return 0
+  fi
+
+  if command -v snappy-switcher &>/dev/null; then
+    print_success "snappy-switcher is already installed"
+    return 0
+  fi
+
+  local missing_tools=()
+  local tool
+  for tool in make gcc pkg-config; do
+    command -v "$tool" &>/dev/null || missing_tools+=("$tool")
+  done
+
+  if [ ${#missing_tools[@]} -gt 0 ]; then
+    print_error "Missing build tools for snappy-switcher: ${missing_tools[*]}"
+    echo "  Install with: sudo dnf install -y gcc make pkgconf-pkg-config wayland-devel cairo-devel pango-devel json-c-devel libxkbcommon-devel glib2-devel librsvg2-devel wayland-protocols-devel"
+    return 1
+  fi
+
+  mkdir -p "$(dirname "$repo_dir")"
+
+  if [ -d "$repo_dir/.git" ]; then
+    log_info "Updating existing snappy-switcher checkout at $repo_dir"
+    git -C "$repo_dir" pull --ff-only || print_warning "Could not update the snappy-switcher checkout"
+  else
+    log_info "Cloning snappy-switcher from $repo_url"
+    if ! git clone --depth 1 "$repo_url" "$repo_dir"; then
+      print_error "Failed to clone snappy-switcher"
+      return 1
+    fi
+  fi
+
+  local old_pwd="$PWD"
+  cd "$repo_dir" || {
+    print_error "Cannot access $repo_dir"
+    return 1
+  }
+
+  if make && sudo make install; then
+    print_success "snappy-switcher installed"
+    log_info "snappy-switcher built from source and installed with make install"
+    cd "$old_pwd" || true
+    return 0
+  fi
+
+  print_error "Failed to build or install snappy-switcher"
   cd "$old_pwd" || true
   return 1
 }
@@ -2584,6 +2654,7 @@ main() {
     install_hyprwave
     install_nordzy_cursors
     install_rofi_emoji
+    install_snappy_switcher
     install_waytrogen_aurora
     setup_lazyvim
     copy_dotfiles
@@ -2608,6 +2679,9 @@ main() {
 
     next_step "Building rofi-emoji plugin from source"
     print_warning "[DRY RUN] Would run autoreconf/configure/make install for rofi-emoji"
+
+    next_step "Building snappy-switcher from source"
+    print_warning "[DRY RUN] Would clone/build/install snappy-switcher"
 
     next_step "Installing waytrogen-aurora"
     print_warning "[DRY RUN] Would clone/build/install waytrogen-aurora and compile schemas"
