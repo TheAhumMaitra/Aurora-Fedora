@@ -2227,6 +2227,46 @@ apply_default_theme() {
   log_info "Applied default theme - Aurora Default"
 }
 
+# Finalize the Aurora theme: start awww-daemon, apply the Aurora Default theme,
+# then restart waybar so it picks up the new theme.
+finalize_aurora_theme() {
+  next_step "Finalizing Aurora theme"
+
+  local aurora_bin
+  aurora_bin="$(command -v aurora || true)"
+  if [ -z "$aurora_bin" ] && [ -x "$HOME/.cargo/bin/aurora" ]; then
+    aurora_bin="$HOME/.cargo/bin/aurora"
+  fi
+
+  if [ "$DRY_RUN" = true ]; then
+    print_warning "[DRY RUN] Would start awww-daemon, apply theme 'Aurora Default', and restart waybar"
+    return 0
+  fi
+
+  log_info "Starting awww-daemon"
+  if command -v awww-daemon &>/dev/null; then
+    awww-daemon &
+    print_success "Started awww-daemon"
+  else
+    print_warning "awww-daemon not found; skipping"
+  fi
+
+  if [ -n "$aurora_bin" ]; then
+    log_info "Applying Aurora Default using $aurora_bin"
+    "$aurora_bin" apply-theme "Aurora Default"
+    print_success "Applied theme 'Aurora Default'"
+  else
+    print_warning "aurora binary not found; skipping apply-theme"
+  fi
+
+  log_info "Restarting waybar"
+  pkill waybar 2>/dev/null || true
+
+  DEFAULT_THEME_STATUS="applied: Aurora Default"
+  print_success "Aurora theme finalization completed"
+  log_info "Finalized Aurora theme (awww-daemon started, Aurora Default applied, waybar restarted)"
+}
+
 # Check for existing Aurora installation
 check_existing_install() {
   local has_aurora=false
@@ -2661,6 +2701,7 @@ main() {
     setup_shell_config
     verify_installation
     apply_default_theme
+    finalize_aurora_theme
   else
     next_step "Installing SDDM astronaut theme"
     print_warning "[DRY RUN] Would clone/configure the SDDM astronaut theme and install fonts"
@@ -2706,6 +2747,9 @@ main() {
     next_step "Applying default theme"
     DEFAULT_THEME_STATUS="dry-run: would apply Aurora Default"
     print_warning "[DRY RUN] Would apply default theme - Aurora Default"
+
+    next_step "Finalizing Aurora theme"
+    print_warning "[DRY RUN] Would start awww-daemon, apply theme 'Aurora Default', and restart waybar"
   fi
 
   set_default_shell_to_fish
